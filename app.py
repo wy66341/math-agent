@@ -162,40 +162,30 @@ HEADER_HTML = """
 # OCR Engine
 # ═══════════════════════════════════════════════════════════════
 
-def ocr_page(image_bytes: bytes) -> str:
-    """OCR a single page image using tesseract with Chinese support."""
-    import subprocess
-    import tempfile
+def _ocr_page_from_pdf(args: tuple) -> tuple[int, str]:
+    """OCR a single page (pg_idx, image_bytes) → (pg_idx, text). Module-level for multiprocessing."""
+    pg_idx, img_bytes = args
+    import subprocess, tempfile
     try:
-        with tempfile.NamedTemporaryFile(suffix='.png', delete=False) as tmp_in:
-            tmp_in.write(image_bytes)
-            tmp_in_path = tmp_in.name
-        tmp_out = tempfile.mktemp(suffix='')
+        with tempfile.NamedTemporaryFile(suffix='.png', delete=False) as f:
+            f.write(img_bytes)
+            inp = f.name
+        out = tempfile.mktemp(suffix='')
         subprocess.run(
-            ['tesseract', tmp_in_path, tmp_out, '-l', 'chi_sim', '--psm', '6'],
+            ['tesseract', inp, out, '-l', 'chi_sim', '--psm', '6'],
             capture_output=True, timeout=30,
         )
-        result = Path(tmp_out + '.txt').read_text(errors='ignore') if Path(tmp_out + '.txt').exists() else ''
-        os.unlink(tmp_in_path)
-        if Path(tmp_out + '.txt').exists():
-            os.unlink(tmp_out + '.txt')
-        return result
+        txt_path = Path(out + '.txt')
+        text = txt_path.read_text(errors='ignore') if txt_path.exists() else ''
+        try:
+            os.unlink(inp)
+            if txt_path.exists():
+                os.unlink(txt_path)
+        except OSError:
+            pass
+        return pg_idx, text
     except Exception:
-        return ''
-
-
-def extract_page_images(pdf_path: str) -> list[bytes]:
-    """Extract each page as a PNG image bytes from a PDF."""
-    import fitz
-    doc = fitz.open(pdf_path)
-    images = []
-    for i in range(len(doc)):
-        page = doc[i]
-        # Render at 250 DPI for good OCR quality
-        pix = page.get_pixmap(dpi=250)
-        images.append(pix.tobytes("png"))
-    doc.close()
-    return images
+        return pg_idx, ''
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -232,109 +222,121 @@ def extract_math_items(text: str) -> list[dict]:
 # Mind Map Builder
 # ═══════════════════════════════════════════════════════════════
 
-def build_mindmap_tree(pdf_path: str) -> dict:
-    """Build a hierarchical mind map tree from a PDF.
-
-    Uses PDF TOC for chapter/section structure, then OCR + regex for math items.
-    Caches results to disk.
-    """
+def build_mindmap_from_toc(pdf_path: str) -> dict:
+    """Instant: build mind map skeleton from PDF table of contents only (no OCR)."""
     import fitz
     doc = fitz.open(pdf_path)
     toc = doc.get_toc()
     doc.close()
 
     filename = Path(pdf_path).stem
-    cache_file = OCR_CACHE_DIR / f"{filename}_tree.json"
-
-    # Check cache
-    if cache_file.exists():
-        try:
-            return json.loads(cache_file.read_text())
-        except Exception:
-            pass
-
-    # Build chapter/section hierarchy from TOC
     tree = {"name": filename, "children": []}
-    chapter_map: dict[int, dict] = {}
 
     for level, title, page in toc:
         title = title.strip()
-        # Skip front matter
         if any(kw in title for kw in ['封面','版权','丛书','前言','目录']):
             continue
         if level == 1:
-            # Chapter
-            node = {"name": title, "children": [], "_page": page}
-            tree["children"].append(node)
-            chapter_map[len(tree["children"]) - 1] = node
-        elif level == 2:
-            # Section
-            if tree["children"]:
-                section = {"name": title, "children": [], "_page": page}
-                tree["children"][-1]["children"].append(section)
+            tree["children"].append({"name": title, "children": [], "_page": page})
+        elif level == 2 and tree["children"]:
+            tree["children"][-1]["children"].append(
+                {"name": title, "children": [], "_page": page})
 
-    # OCR each page and extract math items
-    print(f"  🔍 OCR + 提取数学条目中...")
-    images = extract_page_images(pdf_path)
-    total = len(images)
+    return tree
 
-    for pg_idx, img in enumerate(images):
-        text = ocr_page(img)
-        if not text.strip():
-            continue
 
-        items = extract_math_items(text)
-        if not items:
-            continue
+def enrich_tree_with_ocr(pdf_path: str, tree: dict) -> dict:
+    """Background: OCR all pages in parallel, extract math items, enrich the tree in-place.
+    Returns the same tree object enriched with math items. Caches full result.
+    Uses multiprocessing (~8 workers → ~30s for 192 pages at 200 DPI).
+    """
+    import fitz, multiprocessing
 
-        # Book page = pg_idx + 1 (approximation)
+    filename = Path(pdf_path).stem
+    tree_cache = OCR_CACHE_DIR / f"{filename}_tree_full.json"
+
+    if tree_cache.exists():
+        try:
+            cached = json.loads(tree_cache.read_text())
+            # Copy items from cache into current tree
+            for ch_idx, ch in enumerate(tree.get("children", [])):
+                if ch_idx < len(cached.get("children", [])):
+                    for sec_idx, sec in enumerate(ch.get("children", [])):
+                        cached_secs = cached["children"][ch_idx].get("children", [])
+                        if sec_idx < len(cached_secs):
+                            sec["children"] = cached_secs[sec_idx].get("children", [])
+            return tree
+        except Exception:
+            pass
+
+    # Extract page images at 200 DPI
+    doc = fitz.open(pdf_path)
+    total = len(doc)
+    page_images = [(i, doc[i].get_pixmap(dpi=200).tobytes("png")) for i in range(total)]
+    doc.close()
+
+    n_workers = min(8, multiprocessing.cpu_count())
+    print(f"  🔍 并行 OCR ({n_workers} workers × {total} pages @ 200 DPI)...")
+    start = datetime.now()
+
+    with multiprocessing.Pool(n_workers) as pool:
+        results = {}
+        done = 0
+        for pg_idx, text in pool.imap_unordered(_ocr_page_from_pdf, page_images):
+            if text.strip():
+                results[pg_idx] = text
+            done += 1
+            if done % 20 == 0:
+                print(f"    OCR: {done}/{total} ({100*done//total}%)")
+
+    elapsed = (datetime.now() - start).total_seconds()
+    print(f"  ✅ OCR: {len(results)}/{total} 页, {elapsed:.0f}s")
+
+    # Build page→(ch_idx, sec_idx) mapping
+    page_map: dict[int, tuple] = {}
+    for ch_idx, ch in enumerate(tree["children"]):
+        for s_idx, sec in enumerate(ch.get("children", [])):
+            start = sec.get("_page", 0)
+            end = 99999
+            if s_idx + 1 < len(ch["children"]):
+                end = ch["children"][s_idx + 1].get("_page", 99999)
+            for p in range(start, end):
+                page_map[p] = (ch_idx, s_idx)
+
+    # Collect text per section
+    section_texts: dict[tuple, list[str]] = {}
+    for pg_idx, text in sorted(results.items()):
         book_page = pg_idx + 1
-
-        # Find which chapter/section this page belongs to
-        target_section = None
-        for ch_idx, ch_node in enumerate(tree["children"]):
-            ch_page = ch_node.get("_page", 0)
-            for s_idx, sec_node in enumerate(ch_node.get("children", [])):
-                sec_page = sec_node.get("_page", 0)
-                next_sec_page = (
-                    ch_node["children"][s_idx + 1].get("_page", 99999)
-                    if s_idx + 1 < len(ch_node["children"]) else 99999
-                )
-                if sec_page <= book_page < next_sec_page:
-                    target_section = sec_node
+        key = page_map.get(book_page)
+        if key is None:
+            # Find nearest
+            for p in range(book_page, 0, -1):
+                if p in page_map:
+                    key = page_map[p]
                     break
-            if target_section:
-                break
+        if key is not None:
+            section_texts.setdefault(key, []).append(text)
 
-        if target_section is None and tree["children"]:
-            # Assign to last section of last chapter if beyond known range
-            last_ch = tree["children"][-1]
-            if last_ch.get("children"):
-                target_section = last_ch["children"][-1]
-
-        if target_section is not None:
-            for item in items:
-                target_section["children"].append({
+    # Extract and add items
+    total_items = 0
+    for (ch_idx, sec_idx), texts in section_texts.items():
+        combined = '\n'.join(texts)
+        items = extract_math_items(combined)
+        seen = set()
+        sec = tree["children"][ch_idx]["children"][sec_idx]
+        for item in items:
+            if item['label'] not in seen:
+                seen.add(item['label'])
+                sec["children"].append({
                     "name": f"{item['label']}",
                     "_type": item['type'],
                     "_desc": item['desc'][:100],
                 })
+        sec["children"] = sec["children"][:30]
+        total_items += len(sec["children"])
 
-    # Collapse: if a chapter has many children, keep structure clean
-    for ch in tree["children"]:
-        for sec in ch.get("children", []):
-            # Deduplicate items within a section
-            seen_names = set()
-            unique_items = []
-            for item in sec.get("children", []):
-                if item["name"] not in seen_names:
-                    seen_names.add(item["name"])
-                    unique_items.append(item)
-            sec["children"] = unique_items[:30]  # max 30 items per section
-
-    # Save cache
-    cache_file.write_text(json.dumps(tree, ensure_ascii=False, indent=2))
-    print(f"  ✅ 思维导图缓存: {cache_file}")
+    print(f"  📌 提取 {total_items} 个数学条目")
+    tree_cache.write_text(json.dumps(tree, ensure_ascii=False, indent=2))
     return tree
 
 
@@ -342,35 +344,89 @@ def build_mindmap_tree(pdf_path: str) -> dict:
 # OCR Full Text for RAG
 # ═══════════════════════════════════════════════════════════════
 
-def ocr_full_text(pdf_path: str) -> str:
-    """OCR entire PDF and return as text. Cached."""
+def ocr_full_text(pdf_path: str, progress_callback=None) -> str:
+    """OCR entire PDF in parallel. Cached to disk."""
+    import fitz, multiprocessing
+
     filename = Path(pdf_path).stem
-    cache_file = OCR_CACHE_DIR / f"{filename}_fulltext.txt"
+    text_cache = OCR_CACHE_DIR / f"{filename}_fulltext.txt"
 
-    if cache_file.exists():
-        return cache_file.read_text()
+    if text_cache.exists():
+        return text_cache.read_text()
 
-    print(f"  📝 OCR 全文提取中 ({Path(pdf_path).name})...")
-    images = extract_page_images(pdf_path)
-    all_text = []
-    total = len(images)
+    doc = fitz.open(pdf_path)
+    total = len(doc)
+    page_images = []
+    for i in range(total):
+        pix = doc[i].get_pixmap(dpi=200)
+        page_images.append((i, pix.tobytes("png")))
+    doc.close()
 
-    for i, img in enumerate(images):
-        text = ocr_page(img)
-        if text.strip():
-            all_text.append(f"[第{i+1}页]\n{text}")
-        if (i + 1) % 20 == 0:
-            print(f"    OCR 进度: {i+1}/{total}")
+    n_workers = min(8, multiprocessing.cpu_count())
+    results = {}
+    done = 0
+    with multiprocessing.Pool(n_workers) as pool:
+        for pg_idx, text in pool.imap_unordered(_ocr_page_from_pdf, page_images):
+            if text.strip():
+                results[pg_idx] = text
+            done += 1
+            if progress_callback and done % 20 == 0:
+                progress_callback(done / total)
 
-    full_text = "\n\n".join(all_text)
-    cache_file.write_text(full_text)
-    print(f"  ✅ OCR 全文缓存: {cache_file} ({len(full_text)} 字符)")
+    full_text = '\n\n'.join(
+        f"[第{pg+1}页]\n{results[pg]}"
+        for pg in sorted(results)
+    )
+    text_cache.write_text(full_text)
+    print(f"  📝 全文 OCR 缓存: {len(full_text)} 字符")
     return full_text
 
 
-# ═══════════════════════════════════════════════════════════════
-# FAISS RAG (simplified, embedded)
-# ═══════════════════════════════════════════════════════════════
+def build_rag_index(pdf_path: str, progress_callback=None) -> dict:
+    """Build FAISS index from OCR'd textbook."""
+    global _faiss_index, _all_chunks, _rag_ready
+    import faiss
+
+    if progress_callback:
+        progress_callback(0.05)
+
+    text = ocr_full_text(pdf_path, progress_callback)
+    if not text.strip():
+        return {"status": "error", "message": "OCR 未提取到文字"}
+
+    if progress_callback:
+        progress_callback(0.5)
+
+    raw_chunks = _chunk_text(text)
+    if not raw_chunks:
+        return {"status": "error", "message": "文本分块失败"}
+
+    model = _get_embedding_model()
+    vecs = model.encode(raw_chunks, show_progress_bar=False, normalize_embeddings=True)
+    vecs = np.array(vecs, dtype=np.float32)
+
+    if progress_callback:
+        progress_callback(0.85)
+
+    dim = vecs.shape[1]
+    _faiss_index = faiss.IndexFlatIP(dim)
+    _faiss_index.add(vecs)
+
+    _all_chunks = []
+    for i, chunk in enumerate(raw_chunks):
+        page_match = re.search(r'\[第(\d+)页\]', chunk)
+        page = int(page_match.group(1)) if page_match else 0
+        _all_chunks.append({'text': chunk, 'page': page, 'id': i})
+
+    _rag_ready = True
+    if progress_callback:
+        progress_callback(1.0)
+
+    return {
+        "status": "ok",
+        "total_chunks": len(_all_chunks),
+        "total_chars": len(text),
+    }
 
 _faiss_index = None
 _all_chunks: list[dict] = []
@@ -408,41 +464,6 @@ def _chunk_text(text: str, size=CHUNK_SIZE, overlap=CHUNK_OVERLAP):
         start = end - overlap if end < len(text) else len(text)
     return chunks
 
-
-def build_rag_index(pdf_path: str) -> dict:
-    """Build FAISS index from OCR'd textbook."""
-    global _faiss_index, _all_chunks, _rag_ready
-    import faiss
-
-    text = ocr_full_text(pdf_path)
-    if not text.strip():
-        return {"status": "error", "message": "OCR 未提取到文字"}
-
-    raw_chunks = _chunk_text(text)
-    if not raw_chunks:
-        return {"status": "error", "message": "文本分块失败"}
-
-    model = _get_embedding_model()
-    vecs = model.encode(raw_chunks, show_progress_bar=False, normalize_embeddings=True)
-    vecs = np.array(vecs, dtype=np.float32)
-
-    dim = vecs.shape[1]
-    _faiss_index = faiss.IndexFlatIP(dim)
-    _faiss_index.add(vecs)
-
-    _all_chunks = []
-    for i, chunk in enumerate(raw_chunks):
-        # Extract page number from chunk
-        page_match = re.search(r'\[第(\d+)页\]', chunk)
-        page = int(page_match.group(1)) if page_match else 0
-        _all_chunks.append({'text': chunk, 'page': page, 'id': i})
-
-    _rag_ready = True
-    return {
-        "status": "ok",
-        "total_chunks": len(_all_chunks),
-        "total_chars": len(text),
-    }
 
 
 def rag_query(question: str) -> tuple[str, str]:
@@ -640,7 +661,7 @@ _current_tree: dict | None = None
 # ═══════════════════════════════════════════════════════════════
 
 def upload_and_process(file):
-    """Handle file upload: parse, OCR, build mind map and RAG index."""
+    """Two-phase processing: (1) instant TOC mind map → (2) background OCR + RAG index."""
     global _current_pdf_path, _current_tree
 
     if file is None:
@@ -657,55 +678,114 @@ def upload_and_process(file):
     shutil.copy(fpath, str(dst))
     _current_pdf_path = str(dst)
 
+    # ── Phase 1: Instant TOC mind map (no OCR) ──────────────
+    try:
+        tree = build_mindmap_from_toc(str(dst))
+        _current_tree = tree
+    except Exception as e:
+        yield (
+            f'<span class="status-badge empty">解析失败: {e}</span>',
+            _make_mindmap_html(None),
+            gr.Dropdown(choices=[], value=None),
+            f"❌ {e}",
+        )
+        return
+
+    ch_count = len(tree.get("children", []))
+    sec_count = sum(len(ch.get("children", [])) for ch in tree.get("children", []))
+    choices = _build_choices(tree)
+
     yield (
-        '<span class="status-badge processing">OCR 解析中...</span>',
-        '<div class="empty-state"><div class="icon">⏳</div><p>正在 OCR 解析，请稍候...</p></div>',
-        gr.Dropdown(choices=[], value=None),
-        "正在构建索引...",
+        '<span class="status-badge processing">思维导图就绪 — OCR 进行中...</span>',
+        _make_mindmap_html(tree),
+        gr.Dropdown(choices=choices[:500], value=None),
+        f"📘 {ch_count} 章 · {sec_count} 节 | 🔍 正在 OCR 识别定理/定义...",
     )
 
+    # ── Phase 2: Background OCR + enrich + RAG ─────────────
     try:
-        # Build mind map
-        tree = build_mindmap_tree(str(dst))
-        _current_tree = tree
+        import threading
 
-        # Count stats
-        ch_count = len(tree.get("children", []))
-        sec_count = sum(len(ch.get("children", [])) for ch in tree.get("children", []))
+        ocr_done = [False]
+        rag_done = [False]
+        progress = [0.0]
+
+        def ocr_thread():
+            nonlocal tree
+            try:
+                enrich_tree_with_ocr(str(dst), tree)
+            except Exception as e:
+                print(f"OCR enrich error: {e}")
+            ocr_done[0] = True
+
+        def rag_thread():
+            try:
+                build_rag_index(str(dst))
+            except Exception as e:
+                print(f"RAG build error: {e}")
+            rag_done[0] = True
+
+        t1 = threading.Thread(target=ocr_thread)
+        t2 = threading.Thread(target=rag_thread)
+        t1.start()
+        t2.start()
+
+        # Wait for OCR to finish (RAG may take longer, show progress)
+        while not ocr_done[0]:
+            time.sleep(2)
+
+        # Re-count with items
         item_count = sum(
             len(sec.get("children", []))
             for ch in tree.get("children", [])
             for sec in ch.get("children", [])
         )
+        choices = _build_choices(tree)
 
-        # Build RAG index
-        idx_info = build_rag_index(str(dst))
-
-        # Build chapter selector choices
-        choices = []
-        for ch in tree.get("children", []):
-            choices.append(f"📘 {ch['name']}")
-            for sec in ch.get("children", []):
-                choices.append(f"  📄 {sec['name']}")
-                for item in sec.get("children", []):
-                    choices.append(f"    📌 {item['name']}")
-
-        status = f'<span class="status-badge ready">已就绪</span>'
-        stats = f"共 {ch_count} 章 · {sec_count} 节 · {item_count} 个知识点 · {idx_info.get('total_chunks','?')} 个索引块"
+        if rag_done[0]:
+            status_html = '<span class="status-badge ready">已就绪</span>'
+            info = f"✅ {ch_count} 章 · {sec_count} 节 · {item_count} 个知识点 · RAG 索引已构建"
+        else:
+            status_html = '<span class="status-badge processing">RAG 索引构建中...</span>'
+            info = f"📘 {ch_count} 章 · {sec_count} 节 · {item_count} 个知识点 | ⏳ RAG 索引构建中..."
 
         yield (
-            status,
+            status_html,
             _make_mindmap_html(tree),
             gr.Dropdown(choices=choices[:500], value=None),
-            f"✅ {stats}",
+            info,
         )
+
+        # Wait for RAG
+        t2.join(timeout=30)
+
+        choices = _build_choices(tree)
+        yield (
+            '<span class="status-badge ready">已就绪</span>',
+            _make_mindmap_html(tree),
+            gr.Dropdown(choices=choices[:500], value=None),
+            f"✅ {ch_count} 章 · {sec_count} 节 · {item_count} 个知识点 · RAG 就绪",
+        )
+
     except Exception as e:
         yield (
-            f'<span class="status-badge empty">失败: {str(e)[:60]}</span>',
-            _make_mindmap_html(None),
-            gr.Dropdown(choices=[], value=None),
-            f"处理失败: {str(e)[:100]}",
+            f'<span class="status-badge ready">部分就绪</span>',
+            _make_mindmap_html(tree),
+            gr.Dropdown(choices=choices[:500], value=None),
+            f"⚠️ 思维导图就绪，但 OCR 出错: {str(e)[:80]}",
         )
+
+
+def _build_choices(tree: dict) -> list:
+    """Build dropdown choices from tree."""
+    choices = []
+    for ch in tree.get("children", []):
+        choices.append(f"📘 {ch['name']}")
+        for sec in ch.get("children", []):
+            choices.append(f"  📄 {sec['name']}")
+            for item in sec.get("children", []):
+                choices.append(f"    📌 {item['name']}")
+    return choices
 
 
 def on_node_select(selected: str):
