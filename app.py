@@ -318,27 +318,76 @@ def enrich_tree_with_ocr(pdf_path: str, tree: dict) -> dict:
         if key is not None:
             section_texts.setdefault(key, []).append(text)
 
-    # Extract and add items
-    total_items = 0
+    # LLM summarization per section
+    print(f"  🤖 LLM 生成章节总结...")
+    section_data = []  # [(ch_idx, sec_idx, combined_text)]
     for (ch_idx, sec_idx), texts in section_texts.items():
-        combined = '\n'.join(texts)
-        items = extract_math_items(combined)
-        seen = set()
-        sec = tree["children"][ch_idx]["children"][sec_idx]
-        for item in items:
-            if item['label'] not in seen:
-                seen.add(item['label'])
-                sec["children"].append({
-                    "name": f"{item['label']}",
-                    "_type": item['type'],
-                    "_desc": item['desc'][:100],
-                })
-        sec["children"] = sec["children"][:30]
-        total_items += len(sec["children"])
+        combined = '\n'.join(texts)[:1200]  # first 1200 chars for summary
+        if len(combined) > 50:
+            section_data.append((ch_idx, sec_idx, combined))
 
-    print(f"  📌 提取 {total_items} 个数学条目")
+    if section_data:
+        summaries = _batch_summarize(section_data)
+        for (ch_idx, sec_idx, _), summary in zip(section_data, summaries):
+            if summary and summary.strip():
+                sec = tree["children"][ch_idx]["children"][sec_idx]
+                sec["children"].append({
+                    "name": summary.strip()[:120],
+                    "_type": "总结",
+                    "_desc": "",
+                })
+        print(f"  ✅ 生成 {len(summaries)} 条总结")
+
     tree_cache.write_text(json.dumps(tree, ensure_ascii=False, indent=2))
     return tree
+
+
+def _batch_summarize(section_data: list[tuple]) -> list[str]:
+    """Call LLM to summarize each section in one batch."""
+    import httpx
+    api_key = os.getenv("DASHSCOPE_API_KEY", "")
+    if not api_key:
+        return [""] * len(section_data)
+
+    # Build prompt with all sections
+    parts = []
+    for i, (ch_idx, sec_idx, text) in enumerate(section_data):
+        sec_name = text.split('\n')[0][:40] if text else f"Section {i}"
+        parts.append(f"[{i}] {sec_name}\n{text[:800]}")
+
+    prompt = "\n\n".join(parts)
+    system_msg = "你是一个数学教材摘要助手。对下方每个编号的章节内容，用一句中文总结该节的核心数学概念或结论。输出格式：每行一个 [编号] 总结。不要编号之外的任何内容。"
+
+    try:
+        resp = httpx.post(
+            "https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions",
+            headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+            json={
+                "model": os.getenv("LLM_MODEL", "qwen-plus"),
+                "messages": [
+                    {"role": "system", "content": system_msg},
+                    {"role": "user", "content": prompt},
+                ],
+                "temperature": 0.3, "max_tokens": 2000,
+            },
+            timeout=httpx.Timeout(90),
+        )
+        data = resp.json()
+        response_text = data["choices"][0]["message"]["content"]
+
+        # Parse response: each line starts with [N]
+        import re as _re
+        results = {}
+        for line in response_text.strip().split('\n'):
+            m = _re.match(r'\[(\d+)\]\s*(.+)', line.strip())
+            if m:
+                idx = int(m.group(1))
+                results[idx] = m.group(2).strip()
+
+        return [results.get(i, "") for i in range(len(section_data))]
+    except Exception as e:
+        print(f"  ⚠️ LLM 总结失败: {e}")
+        return [""] * len(section_data)
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -570,61 +619,50 @@ def _build_citations_html(citations: list[dict]) -> str:
 # ═══════════════════════════════════════════════════════════════
 
 def _make_mindmap_html(tree: dict | None) -> str:
-    """Generate indented tree using pure divs — no <details> to avoid Gradio CSS conflict."""
+    """Interactive tree — pure JS (no CDN), expand/collapse via iframe."""
     if tree is None or not tree.get("children"):
         return """<div class="empty-state"><div class="icon">🗺️</div>
 <p>请上传教材以生成思维导图</p></div>"""
 
-    # Clean names
     def clean_node(node):
         node['name'] = node['name'].strip().lstrip('﻿​‎‏')
         for child in node.get('children', []):
             clean_node(child)
     clean_node(tree)
 
-    type_colors = {
-        '定义': '#6366f1', '定理': '#ef4444', '命题': '#f59e0b',
-        '推论': '#10b981', '引理': '#3b82f6',
-    }
-
-    def render_node(node, depth=0):
-        indent = depth * 20
-        name = node['name'][:55]
-        has_children = bool(node.get('children'))
+    # Build HTML tree with collapsible nodes
+    def render_node_html(node, depth=0):
+        name = node['name'][:60]
         item_type = node.get('_type', '')
-        color = type_colors.get(item_type, '#94a3b8')
+        has_kids = bool(node.get('children'))
 
-        if item_type:
-            prefix = f'<span style="color:{color};font-weight:700;font-size:0.72rem">◆{item_type}</span> '
-        elif has_children:
-            prefix = f'<span style="color:#6366f1;font-weight:700">▸</span> '
-        else:
-            prefix = f'<span style="color:#cbd5e1">·</span> '
+        indent = depth * 22
+        icon = {'总结': '📝', '定义': '🟣', '定理': '🔴', '命题': '🟠', '推论': '🟢', '引理': '🔵'}.get(item_type, '')
+        display_name = f'{icon} {name}' if icon else name
 
-        if depth == 0:
-            # Chapter
-            line = f'<div style="padding:5px 0;font-weight:700;font-size:0.9rem;color:#0f172a">{prefix}{name}</div>'
-        elif depth == 1:
-            # Section
-            line = f'<div style="padding:3px 0;font-weight:600;font-size:0.82rem;color:#334155">{prefix}{name}</div>'
-        else:
-            # Item
-            desc = node.get('_desc', '')[:60]
-            line = f'<div style="padding:1px 0;font-size:0.75rem;color:#475569">{prefix}{name}</div>'
-            if desc:
-                line += f'<div style="padding:0 0 2px {indent+38}px;font-size:0.68rem;color:#94a3b8">{desc}</div>'
+        if not has_kids:
+            color = '#334155' if depth < 2 else '#64748b'
+            size = '0.85rem' if depth == 0 else ('0.8rem' if depth == 1 else '0.75rem')
+            weight = '700' if depth == 0 else ('600' if depth == 1 else '400')
+            return f'<div style="margin-left:{indent}px;padding:3px 0;font-size:{size};font-weight:{weight};color:{color}">{display_name}</div>'
 
-        if has_children:
-            children = '\n'.join(render_node(ch, depth + 1) for ch in node['children'][:40])
-            return f'<div style="margin-left:{indent}px;border-left:1.5px solid #e2e8f0;padding-left:12px">{line}{children}</div>'
-        else:
-            return f'<div style="margin-left:{indent}px;padding-left:0">{line}</div>'
+        kid_id = f"k{hash(name) & 0x7FFFFFFF}"
+        kids_html = ''.join(render_node_html(k, depth + 1) for k in node['children'][:40])
+        collapsed = 'none' if depth >= 2 else 'block'
+        arrow = '▼' if collapsed == 'block' else '▶'
 
-    inner = '\n'.join(render_node(ch) for ch in tree['children'])
-    return f"""<div style="background:#fff;border-radius:16px;padding:18px 22px;max-height:620px;overflow:auto;font-family:-apple-system,'Noto Sans SC','PingFang SC',sans-serif;line-height:1.6;color:#0f172a">
-<div style="font-weight:800;font-size:0.95rem;padding:6px 0 14px;border-bottom:2px solid #e2e8f0;margin-bottom:10px">📖 {tree['name']}</div>
-{inner}
-</div>"""
+        return f'''<div class="tn" style="margin-left:{indent}px">
+<div class="tt" onclick="var e=document.getElementById('{kid_id}');var a=this.querySelector('.ar');if(e.style.display==='none'){{e.style.display='block';a.textContent='▼'}}else{{e.style.display='none';a.textContent='▶'}}" style="cursor:pointer;padding:3px 0;font-weight:{700 if depth<2 else 600};font-size:{'0.88rem' if depth==0 else '0.82rem'};color:#0f172a;user-select:none">
+<span class="ar" style="display:inline-block;width:16px;color:#94a3b8">{arrow}</span> {display_name}</div>
+<div id="{kid_id}" style="display:{collapsed};padding-left:8px;border-left:2px solid #e2e8f0">{kids_html}</div>
+</div>'''
+
+    inner = ''.join(render_node_html(ch) for ch in tree['children'])
+    page = f'<!DOCTYPE html><html lang="zh"><head><meta charset="utf-8"><style>body{{font-family:-apple-system,"PingFang SC","Noto Sans SC",sans-serif;background:#fff;margin:0;padding:16px 20px;line-height:1.7;overflow-y:auto;max-height:100vh}}.tn{{}}.tt{{transition:color .15s}}.tt:hover{{color:#6366f1!important}}</style></head><body><div style="font-weight:800;font-size:1rem;color:#0f172a;padding:4px 0 14px;border-bottom:2px solid #e2e8f0;margin-bottom:8px">📖 {tree["name"]}</div>{inner}</body></html>'
+
+    import base64
+    encoded = base64.b64encode(page.encode()).decode()
+    return f'<iframe src="data:text/html;base64,{encoded}" style="width:100%;height:640px;border:none;border-radius:16px;background:#fff"></iframe>'
 
 
 # ═══════════════════════════════════════════════════════════════
