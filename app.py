@@ -193,13 +193,13 @@ def _ocr_page_from_pdf(args: tuple) -> tuple[int, str]:
 # Math Content Extraction
 # ═══════════════════════════════════════════════════════════════
 
-# Patterns for math items in OCR'd text
+# Patterns for math items in OCR'd text — broad matching for OCR noise tolerance
 MATH_ITEM_PATTERNS = [
-    (re.compile(r'(定义\s*\d+(?:\.\d+)*)\s*(.*?)(?=(?:定义\s*\d|定理\s*\d|命题\s*\d|推论\s*\d|引理\s*\d|例\s*\d|证明|$))', re.DOTALL), '定义'),
-    (re.compile(r'(定理\s*\d+(?:\.\d+)*)\s*(.*?)(?=(?:定义\s*\d|定理\s*\d|命题\s*\d|推论\s*\d|引理\s*\d|例\s*\d|证明|$))', re.DOTALL), '定理'),
-    (re.compile(r'(命题\s*\d+(?:\.\d+)*)\s*(.*?)(?=(?:定义\s*\d|定理\s*\d|命题\s*\d|推论\s*\d|引理\s*\d|例\s*\d|证明|$))', re.DOTALL), '命题'),
-    (re.compile(r'(推论\s*\d+(?:\.\d+)*)\s*(.*?)(?=(?:定义\s*\d|定理\s*\d|命题\s*\d|推论\s*\d|引理\s*\d|例\s*\d|证明|$))', re.DOTALL), '推论'),
-    (re.compile(r'(引理\s*\d+(?:\.\d+)*)\s*(.*?)(?=(?:定义\s*\d|定理\s*\d|命题\s*\d|推论\s*\d|引理\s*\d|例\s*\d|证明|$))', re.DOTALL), '引理'),
+    (re.compile(r'(定义\s*\d+(?:\.\d+)?)\s*(.{5,150}?)(?=(?:定义\s*\d|定理\s*\d|命题\s*\d|推论\s*\d|引理\s*\d|例\s*\d|证明|设|则|若|$))', re.DOTALL), '定义'),
+    (re.compile(r'(定理\s*\d+(?:\.\d+)?)\s*(.{5,150}?)(?=(?:定义\s*\d|定理\s*\d|命题\s*\d|推论\s*\d|引理\s*\d|例\s*\d|证明|设|则|若|$))', re.DOTALL), '定理'),
+    (re.compile(r'(命题\s*\d+(?:\.\d+)?)\s*(.{5,150}?)(?=(?:定义\s*\d|定理\s*\d|命题\s*\d|推论\s*\d|引理\s*\d|例\s*\d|证明|设|则|若|$))', re.DOTALL), '命题'),
+    (re.compile(r'(推论\s*\d+(?:\.\d+)?)\s*(.{5,150}?)(?=(?:定义\s*\d|定理\s*\d|命题\s*\d|推论\s*\d|引理\s*\d|例\s*\d|证明|设|则|若|$))', re.DOTALL), '推论'),
+    (re.compile(r'(引理\s*\d+(?:\.\d+)?)\s*(.{5,150}?)(?=(?:定义\s*\d|定理\s*\d|命题\s*\d|推论\s*\d|引理\s*\d|例\s*\d|证明|设|则|若|$))', re.DOTALL), '引理'),
 ]
 
 
@@ -536,7 +536,7 @@ def rag_query(question: str) -> tuple[str, str]:
             json={
                 "model": os.getenv("LLM_MODEL", "qwen-max"),
                 "messages": [
-                    {"role": "system", "content": "你是数学助教。仅根据参考资料回答，每个关键陈述标注 [第X页]。参考资料不足时说明。"},
+                    {"role": "system", "content": "你是数学助教。仅根据参考资料回答。要求：1) 数学公式用 LaTeX 格式，行内用 $...$，独立公式用 $$...$$；2) 每个关键陈述标注 [第X页]；3) 参考资料不足时说明。"},
                     {"role": "user", "content": f"参考资料：\n\n{context}\n\n问题：{question}"},
                 ],
                 "temperature": 0.3, "max_tokens": 1500,
@@ -570,7 +570,7 @@ def _build_citations_html(citations: list[dict]) -> str:
 # ═══════════════════════════════════════════════════════════════
 
 def _make_mindmap_html(tree: dict | None) -> str:
-    """Generate a pure HTML/CSS collapsible tree (no JS needed, works in Gradio)."""
+    """Generate indented tree using pure divs — no <details> to avoid Gradio CSS conflict."""
     if tree is None or not tree.get("children"):
         return """<div class="empty-state"><div class="icon">🗺️</div>
 <p>请上传教材以生成思维导图</p></div>"""
@@ -587,37 +587,42 @@ def _make_mindmap_html(tree: dict | None) -> str:
         '推论': '#10b981', '引理': '#3b82f6',
     }
 
-    def render_node(node, depth=0) -> str:
-        name = node['name'][:50]
+    def render_node(node, depth=0):
+        indent = depth * 20
+        name = node['name'][:55]
         has_children = bool(node.get('children'))
         item_type = node.get('_type', '')
-        desc = node.get('_desc', '')[:80]
-        color = type_colors.get(item_type, '#64748b')
-        dot = f'<span style="color:{color};font-weight:700">{"◆" if item_type else "●"}</span>'
+        color = type_colors.get(item_type, '#94a3b8')
 
-        if not has_children:
-            title = f'{dot} <span style="font-size:0.78rem;color:#475569">{name}</span>'
-            if desc:
-                title += f' <span style="font-size:0.68rem;color:#94a3b8">— {desc}</span>'
-            return f'<div style="padding:2px 0 2px {depth*20+18}px;line-height:1.6">{title}</div>'
-
-        ch_html = '\n'.join(render_node(ch, depth + 1) for ch in node['children'][:40])
-        marker = '▼' if depth < 2 else '▶'
-        header = f'{dot} <b style="font-size:0.82rem;color:#0f172a">{name}</b>'
         if item_type:
-            header += f' <span style="font-size:0.65rem;background:{color}15;color:{color};padding:1px 6px;border-radius:8px">{item_type}</span>'
-        if has_children:
-            header += f' <span style="font-size:0.65rem;color:#94a3b8">({len(node["children"])})</span>'
+            prefix = f'<span style="color:{color};font-weight:700;font-size:0.72rem">◆{item_type}</span> '
+        elif has_children:
+            prefix = f'<span style="color:#6366f1;font-weight:700">▸</span> '
+        else:
+            prefix = f'<span style="color:#cbd5e1">·</span> '
 
-        open_attr = ' open' if depth < 2 else ''
-        return f'''<details{open_attr} style="padding:1px 0 1px {depth*20}px">
-<summary style="cursor:pointer;padding:3px 0;line-height:1.8;list-style:none">{header}</summary>
-{ch_html}
-</details>'''
+        if depth == 0:
+            # Chapter
+            line = f'<div style="padding:5px 0;font-weight:700;font-size:0.9rem;color:#0f172a">{prefix}{name}</div>'
+        elif depth == 1:
+            # Section
+            line = f'<div style="padding:3px 0;font-weight:600;font-size:0.82rem;color:#334155">{prefix}{name}</div>'
+        else:
+            # Item
+            desc = node.get('_desc', '')[:60]
+            line = f'<div style="padding:1px 0;font-size:0.75rem;color:#475569">{prefix}{name}</div>'
+            if desc:
+                line += f'<div style="padding:0 0 2px {indent+38}px;font-size:0.68rem;color:#94a3b8">{desc}</div>'
+
+        if has_children:
+            children = '\n'.join(render_node(ch, depth + 1) for ch in node['children'][:40])
+            return f'<div style="margin-left:{indent}px;border-left:1.5px solid #e2e8f0;padding-left:12px">{line}{children}</div>'
+        else:
+            return f'<div style="margin-left:{indent}px;padding-left:0">{line}</div>'
 
     inner = '\n'.join(render_node(ch) for ch in tree['children'])
-    return f"""<div style="background:#fff;border-radius:16px;padding:16px 20px;max-height:620px;overflow:auto;font-family:'Noto Sans SC','PingFang SC',sans-serif;line-height:1.7">
-<div style="font-weight:800;font-size:0.95rem;color:#0f172a;padding:8px 0 12px;border-bottom:2px solid #e2e8f0;margin-bottom:8px">📖 {tree['name']}</div>
+    return f"""<div style="background:#fff;border-radius:16px;padding:18px 22px;max-height:620px;overflow:auto;font-family:-apple-system,'Noto Sans SC','PingFang SC',sans-serif;line-height:1.6;color:#0f172a">
+<div style="font-weight:800;font-size:0.95rem;padding:6px 0 14px;border-bottom:2px solid #e2e8f0;margin-bottom:10px">📖 {tree['name']}</div>
 {inner}
 </div>"""
 
@@ -844,7 +849,7 @@ with gr.Blocks(title="数学教材智能学习系统") as demo:
                 lines=3,
             )
             btn_ask = gr.Button("查询", variant="primary", size="sm", elem_classes="primary")
-            answer_output = gr.Textbox(label="回答", lines=12, interactive=False)
+            answer_output = gr.Markdown(label="回答")
             cites_output = gr.HTML("")
 
     # ── Events ──────────────────────────────────────────
