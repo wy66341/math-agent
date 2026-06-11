@@ -1,6 +1,6 @@
-# 🧠 学科知识整合智能体
+# 🧠 Math Agent — 数学教材智能学习系统
 
-> AI 全栈黑客松参赛项目 — 5 个 AI Agent 协作，把 7 本教材变成不到 30% 的精华，教学效果不打折。
+> 5 个 AI Agent 协作，把数学教材变成不到 30% 的精华，教学效果不打折。
 
 ## 项目架构
 
@@ -46,7 +46,7 @@ graph TB
 
 ```mermaid
 flowchart LR
-    A[7本教材<br/>~350万字] --> B[Embedding<br/>粗筛]
+    A[数学教材<br/>~350万字] --> B[Embedding<br/>粗筛]
     B --> C[LLM<br/>精判]
     C --> D{决策}
     D -->|merge| E[保留最优定义<br/>多源引用]
@@ -77,7 +77,7 @@ flowchart LR
 ## 项目结构
 
 ```
-knowledge-agent/
+math-agent/
 ├── main.py                 # 一键启动入口
 ├── run_pipeline.py         # 端到端测试脚本
 ├── src/
@@ -104,13 +104,13 @@ knowledge-agent/
 ### 1. 环境依赖
 
 - Python 3.10+
-- 7 本医学教材 PDF（存放于 `data/textbooks/`）
+- 数学教材 PDF（存放于 `data/textbooks/`）
 
 ### 2. 安装
 
 ```bash
-git clone <repo-url>
-cd knowledge-agent
+git clone https://github.com/wy66341/math-agent.git
+cd math-agent
 python -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
