@@ -28,3 +28,4 @@ dist/
 
 # ChromaDB
 chroma_db/
+data/processed/
