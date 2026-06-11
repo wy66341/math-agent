@@ -163,29 +163,34 @@ HEADER_HTML = """
 # OCR Engine
 # ═══════════════════════════════════════════════════════════════
 
+_paddle_ocr = None
+
+def _get_paddle_ocr():
+    global _paddle_ocr
+    if _paddle_ocr is None:
+        from paddleocr import PaddleOCR
+        _paddle_ocr = PaddleOCR(lang='ch', use_doc_orientation_classify=False, use_doc_unwarping=False)
+    return _paddle_ocr
+
+
 def _ocr_page_from_pdf(args: tuple) -> tuple[int, str]:
-    """OCR a single page (pg_idx, image_bytes) → (pg_idx, text). Module-level for multiprocessing."""
+    """OCR using PaddleOCR v3 — far better Chinese accuracy than Tesseract."""
     pg_idx, img_bytes = args
-    import subprocess, tempfile
     try:
-        with tempfile.NamedTemporaryFile(suffix='.png', delete=False) as f:
-            f.write(img_bytes)
-            inp = f.name
-        out = tempfile.mktemp(suffix='')
-        subprocess.run(
-            ['tesseract', inp, out, '-l', 'chi_sim', '--psm', '6'],
-            capture_output=True, timeout=30,
-        )
-        txt_path = Path(out + '.txt')
-        text = txt_path.read_text(errors='ignore') if txt_path.exists() else ''
-        try:
-            os.unlink(inp)
-            if txt_path.exists():
-                os.unlink(txt_path)
-        except OSError:
-            pass
-        return pg_idx, text
-    except Exception:
+        import numpy as np
+        from PIL import Image
+        import io
+        ocr = _get_paddle_ocr()
+        img = Image.open(io.BytesIO(img_bytes))
+        result = ocr.predict(np.array(img))
+        if result and len(result) > 0:
+            r = result[0]
+            texts = r.rec_texts if hasattr(r, 'rec_texts') else []
+            scores = r.rec_scores if hasattr(r, 'rec_scores') else []
+            lines = [t for t, s in zip(texts, scores) if s > 0.6]
+            return pg_idx, '\n'.join(lines)
+        return pg_idx, ''
+    except Exception as e:
         return pg_idx, ''
 
 
@@ -273,7 +278,7 @@ def enrich_tree_with_ocr(pdf_path: str, tree: dict) -> dict:
     # Extract page images at 200 DPI
     doc = fitz.open(pdf_path)
     total = len(doc)
-    page_images = [(i, doc[i].get_pixmap(dpi=200).tobytes("png")) for i in range(total)]
+    page_images = [(i, doc[i].get_pixmap(dpi=250).tobytes("png")) for i in range(total)]
     doc.close()
 
     n_workers = min(8, multiprocessing.cpu_count())
@@ -408,7 +413,7 @@ def ocr_full_text(pdf_path: str, progress_callback=None) -> str:
     total = len(doc)
     page_images = []
     for i in range(total):
-        pix = doc[i].get_pixmap(dpi=200)
+        pix = doc[i].get_pixmap(dpi=250)
         page_images.append((i, pix.tobytes("png")))
     doc.close()
 
