@@ -15,6 +15,7 @@ import re
 import sys
 import traceback
 from pathlib import Path
+import time
 from datetime import datetime
 
 ROOT = Path(__file__).parent
@@ -552,64 +553,75 @@ def _build_citations_html(citations: list[dict]) -> str:
 # ═══════════════════════════════════════════════════════════════
 
 def _make_mindmap_html(tree: dict | None) -> str:
-    """Generate ECharts tree chart HTML with expand/collapse."""
+    """Generate ECharts tree chart via iframe with data URI for reliable JS execution."""
     if tree is None or not tree.get("children"):
         return """<div class="empty-state"><div class="icon">🗺️</div>
 <p>请上传教材以生成思维导图</p></div>"""
 
+    # Remove BOM and invisible chars from node names
+    def clean_node(node):
+        node['name'] = node['name'].strip().lstrip('﻿​‎‏')
+        for child in node.get('children', []):
+            clean_node(child)
+    clean_node(tree)
+
+    import base64
     data_json = json.dumps(tree, ensure_ascii=False)
+    # Escape backticks and closing script tags for JS embedding
+    data_safe = data_json.replace('\\', '\\\\').replace('`', '\\`').replace('</script>', '<\\/script>')
 
-    return f"""<div id="mindmap" style="width:100%;height:620px;background:#fff;border-radius:16px;overflow:hidden"></div>
-<script src="https://cdn.jsdelivr.net/npm/echarts@5.5.0/dist/echarts.min.js"></script>
+    html_doc = f"""<!DOCTYPE html>
+<html lang="zh-CN"><head><meta charset="utf-8"><style>
+*{{margin:0;padding:0;box-sizing:border-box}}
+body{{font-family:-apple-system,'Noto Sans SC','PingFang SC','Microsoft YaHei',sans-serif;background:#fff;overflow:hidden}}
+#mindmap{{width:100vw;height:100vh}}
+</style></head><body>
+<div id="mindmap"></div>
+<script src="https://cdn.bootcdn.net/ajax/libs/echarts/5.5.0/echarts.min.js">
+</script>
 <script>
-const treeData = {data_json};
-
-function processNode(node) {{
-  if (node.children && node.children.length > 0) {{
-    node.children = node.children.slice(0, 60);
-    node.children.forEach(processNode);
-  }}
-  // Color coding by type
-  if (node._type === '定义') node.itemStyle = {{ color: '#6366f1' }};
-  else if (node._type === '定理') node.itemStyle = {{ color: '#ef4444' }};
-  else if (node._type === '命题') node.itemStyle = {{ color: '#f59e0b' }};
-  else if (node._type === '推论') node.itemStyle = {{ color: '#10b981' }};
-  else if (node._type === '引理') node.itemStyle = {{ color: '#3b82f6' }};
-  else if (node._type === '例') node.itemStyle = {{ color: '#06b6d4' }};
-  // Truncate long names
-  if (node.name && node.name.length > 22) node.name = node.name.slice(0,20)+'…';
-  return node;
-}}
-processNode(treeData);
-
-const chart = echarts.init(document.getElementById('mindmap'));
-chart.setOption({{
-  tooltip: {{
-    trigger: 'item', triggerOn: 'mousemove',
-    formatter: function(p) {{
-      var desc = p.data._desc || '';
-      return '<b>' + p.name + '</b>' + (desc ? '<br/><span style="font-size:12px;color:#64748b">' + desc.slice(0,200) + '</span>' : '');
+var treeData = {data_safe};
+(function(){{
+  function processNode(node) {{
+    if (node.children && node.children.length > 0) {{
+      node.children = node.children.slice(0, 60);
+      node.children.forEach(processNode);
     }}
-  }},
-  series: [{{
-    type: 'tree', data: [treeData],
-    top: '2%', left: '6%', bottom: '2%', right: '12%',
-    symbol: 'circle', symbolSize: [16,28],
-    orient: 'LR',
-    expandAndCollapse: true,
-    initialTreeDepth: 2,
-    label: {{
-      position: 'left', verticalAlign: 'middle', align: 'right',
-      fontSize: 11, fontFamily: 'Inter, Noto Sans SC, sans-serif',
-      color: '#334155'
+    if (node._type === '定义') node.itemStyle = {{ color: '#6366f1' }};
+    else if (node._type === '定理') node.itemStyle = {{ color: '#ef4444' }};
+    else if (node._type === '命题') node.itemStyle = {{ color: '#f59e0b' }};
+    else if (node._type === '推论') node.itemStyle = {{ color: '#10b981' }};
+    else if (node._type === '引理') node.itemStyle = {{ color: '#3b82f6' }};
+    if (node.name.length > 22) node.name = node.name.slice(0, 20) + '…';
+    return node;
+  }}
+  processNode(treeData);
+  var c = echarts.init(document.getElementById('mindmap'));
+  c.setOption({{
+    tooltip: {{
+      trigger: 'item', triggerOn: 'mousemove',
+      formatter: function(p) {{
+        return '<b>' + p.name + '</b>' + (p.data._desc ? '<br/><span style="font-size:12px;color:#64748b">' + p.data._desc.slice(0, 200) + '</span>' : '');
+      }}
     }},
-    leaves: {{ label: {{ position: 'right', verticalAlign: 'middle', align: 'left' }} }},
-    emphasis: {{ focus: 'descendant' }},
-    lineStyle: {{ color: '#cbd5e1', width: 1.2, curviness: 0.5 }},
-  }}]
-}});
-window.addEventListener('resize', function() {{ chart.resize(); }});
-</script>"""
+    series: [{{
+      type: 'tree', data: [treeData],
+      top: '2%', left: '6%', bottom: '2%', right: '12%',
+      symbol: 'circle', symbolSize: [16, 28],
+      orient: 'LR', expandAndCollapse: true, initialTreeDepth: 2,
+      label: {{ position: 'left', verticalAlign: 'middle', align: 'right', fontSize: 11, color: '#334155' }},
+      leaves: {{ label: {{ position: 'right', verticalAlign: 'middle', align: 'left' }} }},
+      emphasis: {{ focus: 'descendant' }},
+      lineStyle: {{ color: '#cbd5e1', width: 1.2, curviness: 0.5 }},
+    }}]
+  }});
+  window.addEventListener('resize', function() {{ c.resize(); }});
+}})();
+</script>
+</body></html>"""
+
+    encoded = base64.b64encode(html_doc.encode('utf-8')).decode('ascii')
+    return f'<iframe src="data:text/html;base64,{encoded}" style="width:100%;height:640px;border:none;border-radius:16px;background:#fff"></iframe>'
 
 
 # ═══════════════════════════════════════════════════════════════
