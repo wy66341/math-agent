@@ -444,8 +444,25 @@ def _get_embedding_model():
     if _embedding_model is None:
         from sentence_transformers import SentenceTransformer
         model_name = os.getenv("EMBEDDING_MODEL", "BAAI/bge-small-zh-v1.5")
-        _embedding_model = SentenceTransformer(model_name)
+        # Try ModelScope cache first (China-friendly), then HF
+        model_path = _resolve_model_path(model_name)
+        try:
+            _embedding_model = SentenceTransformer(model_path, local_files_only=True)
+        except Exception:
+            _embedding_model = SentenceTransformer(model_path)
     return _embedding_model
+
+
+def _resolve_model_path(model_name: str) -> str:
+    """Resolve model path — ModelScope first, then HuggingFace."""
+    # Strip version suffix from ModelScope dir naming
+    clean_name = model_name.replace(".", "___")
+    ms_dir = os.path.expanduser(f"~/.cache/modelscope/hub/models/{model_name}")
+    ms_dir2 = os.path.expanduser(f"~/.cache/modelscope/hub/models/{clean_name}")
+    for d in [ms_dir, ms_dir2]:
+        if os.path.isdir(d):
+            return d
+    return model_name
 
 
 def _chunk_text(text: str, size=CHUNK_SIZE, overlap=CHUNK_OVERLAP):
@@ -553,75 +570,56 @@ def _build_citations_html(citations: list[dict]) -> str:
 # ═══════════════════════════════════════════════════════════════
 
 def _make_mindmap_html(tree: dict | None) -> str:
-    """Generate ECharts tree chart via iframe with data URI for reliable JS execution."""
+    """Generate a pure HTML/CSS collapsible tree (no JS needed, works in Gradio)."""
     if tree is None or not tree.get("children"):
         return """<div class="empty-state"><div class="icon">🗺️</div>
 <p>请上传教材以生成思维导图</p></div>"""
 
-    # Remove BOM and invisible chars from node names
+    # Clean names
     def clean_node(node):
         node['name'] = node['name'].strip().lstrip('﻿​‎‏')
         for child in node.get('children', []):
             clean_node(child)
     clean_node(tree)
 
-    import base64
-    data_json = json.dumps(tree, ensure_ascii=False)
-    # Escape backticks and closing script tags for JS embedding
-    data_safe = data_json.replace('\\', '\\\\').replace('`', '\\`').replace('</script>', '<\\/script>')
+    type_colors = {
+        '定义': '#6366f1', '定理': '#ef4444', '命题': '#f59e0b',
+        '推论': '#10b981', '引理': '#3b82f6',
+    }
 
-    html_doc = f"""<!DOCTYPE html>
-<html lang="zh-CN"><head><meta charset="utf-8"><style>
-*{{margin:0;padding:0;box-sizing:border-box}}
-body{{font-family:-apple-system,'Noto Sans SC','PingFang SC','Microsoft YaHei',sans-serif;background:#fff;overflow:hidden}}
-#mindmap{{width:100vw;height:100vh}}
-</style></head><body>
-<div id="mindmap"></div>
-<script src="https://cdn.bootcdn.net/ajax/libs/echarts/5.5.0/echarts.min.js">
-</script>
-<script>
-var treeData = {data_safe};
-(function(){{
-  function processNode(node) {{
-    if (node.children && node.children.length > 0) {{
-      node.children = node.children.slice(0, 60);
-      node.children.forEach(processNode);
-    }}
-    if (node._type === '定义') node.itemStyle = {{ color: '#6366f1' }};
-    else if (node._type === '定理') node.itemStyle = {{ color: '#ef4444' }};
-    else if (node._type === '命题') node.itemStyle = {{ color: '#f59e0b' }};
-    else if (node._type === '推论') node.itemStyle = {{ color: '#10b981' }};
-    else if (node._type === '引理') node.itemStyle = {{ color: '#3b82f6' }};
-    if (node.name.length > 22) node.name = node.name.slice(0, 20) + '…';
-    return node;
-  }}
-  processNode(treeData);
-  var c = echarts.init(document.getElementById('mindmap'));
-  c.setOption({{
-    tooltip: {{
-      trigger: 'item', triggerOn: 'mousemove',
-      formatter: function(p) {{
-        return '<b>' + p.name + '</b>' + (p.data._desc ? '<br/><span style="font-size:12px;color:#64748b">' + p.data._desc.slice(0, 200) + '</span>' : '');
-      }}
-    }},
-    series: [{{
-      type: 'tree', data: [treeData],
-      top: '2%', left: '6%', bottom: '2%', right: '12%',
-      symbol: 'circle', symbolSize: [16, 28],
-      orient: 'LR', expandAndCollapse: true, initialTreeDepth: 2,
-      label: {{ position: 'left', verticalAlign: 'middle', align: 'right', fontSize: 11, color: '#334155' }},
-      leaves: {{ label: {{ position: 'right', verticalAlign: 'middle', align: 'left' }} }},
-      emphasis: {{ focus: 'descendant' }},
-      lineStyle: {{ color: '#cbd5e1', width: 1.2, curviness: 0.5 }},
-    }}]
-  }});
-  window.addEventListener('resize', function() {{ c.resize(); }});
-}})();
-</script>
-</body></html>"""
+    def render_node(node, depth=0) -> str:
+        name = node['name'][:50]
+        has_children = bool(node.get('children'))
+        item_type = node.get('_type', '')
+        desc = node.get('_desc', '')[:80]
+        color = type_colors.get(item_type, '#64748b')
+        dot = f'<span style="color:{color};font-weight:700">{"◆" if item_type else "●"}</span>'
 
-    encoded = base64.b64encode(html_doc.encode('utf-8')).decode('ascii')
-    return f'<iframe src="data:text/html;base64,{encoded}" style="width:100%;height:640px;border:none;border-radius:16px;background:#fff"></iframe>'
+        if not has_children:
+            title = f'{dot} <span style="font-size:0.78rem;color:#475569">{name}</span>'
+            if desc:
+                title += f' <span style="font-size:0.68rem;color:#94a3b8">— {desc}</span>'
+            return f'<div style="padding:2px 0 2px {depth*20+18}px;line-height:1.6">{title}</div>'
+
+        ch_html = '\n'.join(render_node(ch, depth + 1) for ch in node['children'][:40])
+        marker = '▼' if depth < 2 else '▶'
+        header = f'{dot} <b style="font-size:0.82rem;color:#0f172a">{name}</b>'
+        if item_type:
+            header += f' <span style="font-size:0.65rem;background:{color}15;color:{color};padding:1px 6px;border-radius:8px">{item_type}</span>'
+        if has_children:
+            header += f' <span style="font-size:0.65rem;color:#94a3b8">({len(node["children"])})</span>'
+
+        open_attr = ' open' if depth < 2 else ''
+        return f'''<details{open_attr} style="padding:1px 0 1px {depth*20}px">
+<summary style="cursor:pointer;padding:3px 0;line-height:1.8;list-style:none">{header}</summary>
+{ch_html}
+</details>'''
+
+    inner = '\n'.join(render_node(ch) for ch in tree['children'])
+    return f"""<div style="background:#fff;border-radius:16px;padding:16px 20px;max-height:620px;overflow:auto;font-family:'Noto Sans SC','PingFang SC',sans-serif;line-height:1.7">
+<div style="font-weight:800;font-size:0.95rem;color:#0f172a;padding:8px 0 12px;border-bottom:2px solid #e2e8f0;margin-bottom:8px">📖 {tree['name']}</div>
+{inner}
+</div>"""
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -714,39 +712,14 @@ def upload_and_process(file):
         f"📘 {ch_count} 章 · {sec_count} 节 | 🔍 正在 OCR 识别定理/定义...",
     )
 
-    # ── Phase 2: Background OCR + enrich + RAG ─────────────
+    # ── Phase 2: OCR (enrich + RAG), sequential to avoid multiprocessing conflicts ──
     try:
-        import threading
+        # Step A: Enrich tree with OCR math items
+        try:
+            enrich_tree_with_ocr(str(dst), tree)
+        except Exception as e:
+            print(f"OCR enrich error: {e}")
 
-        ocr_done = [False]
-        rag_done = [False]
-        progress = [0.0]
-
-        def ocr_thread():
-            nonlocal tree
-            try:
-                enrich_tree_with_ocr(str(dst), tree)
-            except Exception as e:
-                print(f"OCR enrich error: {e}")
-            ocr_done[0] = True
-
-        def rag_thread():
-            try:
-                build_rag_index(str(dst))
-            except Exception as e:
-                print(f"RAG build error: {e}")
-            rag_done[0] = True
-
-        t1 = threading.Thread(target=ocr_thread)
-        t2 = threading.Thread(target=rag_thread)
-        t1.start()
-        t2.start()
-
-        # Wait for OCR to finish (RAG may take longer, show progress)
-        while not ocr_done[0]:
-            time.sleep(2)
-
-        # Re-count with items
         item_count = sum(
             len(sec.get("children", []))
             for ch in tree.get("children", [])
@@ -754,22 +727,18 @@ def upload_and_process(file):
         )
         choices = _build_choices(tree)
 
-        if rag_done[0]:
-            status_html = '<span class="status-badge ready">已就绪</span>'
-            info = f"✅ {ch_count} 章 · {sec_count} 节 · {item_count} 个知识点 · RAG 索引已构建"
-        else:
-            status_html = '<span class="status-badge processing">RAG 索引构建中...</span>'
-            info = f"📘 {ch_count} 章 · {sec_count} 节 · {item_count} 个知识点 | ⏳ RAG 索引构建中..."
-
         yield (
-            status_html,
+            '<span class="status-badge processing">RAG 索引构建中...</span>',
             _make_mindmap_html(tree),
             gr.Dropdown(choices=choices[:500], value=None),
-            info,
+            f"📘 {ch_count} 章 · {sec_count} 节 · {item_count} 个知识点 | 🔍 正在构建索引...",
         )
 
-        # Wait for RAG
-        t2.join(timeout=30)
+        # Step B: Build RAG index (shares cached OCR text)
+        try:
+            build_rag_index(str(dst))
+        except Exception as e:
+            print(f"RAG build error: {e}")
 
         choices = _build_choices(tree)
         yield (
@@ -781,10 +750,10 @@ def upload_and_process(file):
 
     except Exception as e:
         yield (
-            f'<span class="status-badge ready">部分就绪</span>',
+            '<span class="status-badge ready">部分就绪</span>',
             _make_mindmap_html(tree),
             gr.Dropdown(choices=choices[:500], value=None),
-            f"⚠️ 思维导图就绪，但 OCR 出错: {str(e)[:80]}",
+            f"⚠️ 思维导图就绪，但后处理出错: {str(e)[:80]}",
         )
 
 
